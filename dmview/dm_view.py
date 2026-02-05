@@ -176,6 +176,10 @@ class DMView:
             side=tk.LEFT, padx=2, pady=2
         )
 
+        # Hint for DM: how to drag preview to pan player viewport
+        hint = ttk.Label(toolbar, text="Tip: Right-click+drag preview to pan player view", foreground="#888")
+        hint.pack(side=tk.LEFT, padx=10)
+
         # Session actions
         session_frame = ttk.LabelFrame(toolbar, text="Session")
         session_frame.pack(side=tk.RIGHT, padx=5)
