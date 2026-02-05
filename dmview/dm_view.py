@@ -5,6 +5,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import TYPE_CHECKING, Optional
 
 from PIL import Image, ImageTk
+import math
 
 from map_canvas import FogEditor, MapRenderer, screen_to_map, map_to_screen
 from map_import_dialog import MapImportDialog
@@ -36,6 +37,14 @@ class DMView:
         self.current_tool = self.TOOL_BRUSH
         self.reveal_mode = True  # True = reveal, False = hide
         self.brush_size = app.config.brush_size
+
+        # Brush stroke state (for smooth, interpolated drawing)
+        self._brush_editor: Optional[FogEditor] = None
+        self._brush_last_map_pos: Optional[tuple[int, int]] = None
+
+        # Brush preview state (circle that follows mouse)
+        self._brush_preview_id: Optional[int] = None
+        self._last_mouse_pos: Optional[tuple[int, int]] = None
 
         # Drag state
         self._drag_start: Optional[tuple[int, int]] = None
@@ -210,6 +219,10 @@ class DMView:
         self.preview_canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.preview_canvas.bind("<Configure>", self._on_canvas_resize)
 
+        # Mouse movement (for brush preview) and leave
+        self.preview_canvas.bind("<Motion>", self._on_mouse_move)
+        self.preview_canvas.bind("<Leave>", self._on_mouse_leave)
+
         # Right-click drag on DM preview moves the player viewport (intuitive panning)
         self.preview_canvas.bind("<Button-3>", self._on_viewport_drag_start)
         self.preview_canvas.bind("<B3-Motion>", self._on_viewport_drag)
@@ -228,6 +241,7 @@ class DMView:
 
     def _set_tool(self, tool: str) -> None:
         """Set the active tool."""
+        prev_tool = self.current_tool
         self.current_tool = tool
 
         # Update button states visually
@@ -236,17 +250,85 @@ class DMView:
             if t == tool:
                 btn.state(["pressed"])
             else:
-                btn.state(["!pressed"])
+                btn.state(["!pressed"]) 
+
+        # If switching to brush, show preview at last known mouse pos; otherwise clear preview
+        if tool == self.TOOL_BRUSH:
+            if self._last_mouse_pos:
+                x, y = self._last_mouse_pos
+                self._update_brush_preview(x, y)
+        else:
+            self._clear_brush_preview()
+
 
     def _on_mode_change(self) -> None:
         """Handle reveal/hide mode change."""
         self.reveal_mode = self.mode_var.get() == "reveal"
+        # Update preview color if active
+        if self._last_mouse_pos and self.current_tool == self.TOOL_BRUSH:
+            x, y = self._last_mouse_pos
+            self._update_brush_preview(x, y)
 
+    def _on_mouse_move(self, event: tk.Event) -> None:
+        """Track mouse for brush preview and remember last position."""
+        self._last_mouse_pos = (event.x, event.y)
+        if self.current_tool == self.TOOL_BRUSH:
+            self._update_brush_preview(event.x, event.y)
+
+    def _on_mouse_leave(self, event: tk.Event) -> None:
+        """Clear preview when mouse leaves the canvas."""
+        self._last_mouse_pos = None
+        self._clear_brush_preview()
+
+    def _update_brush_preview(self, x: int, y: int) -> None:
+        """Draw or move a preview circle showing current brush size and mode.
+
+        Note: `self.brush_size` is the brush radius in screen pixels (same
+        convention used when applying to the fog mask after converting to
+        map coordinates). Use it directly so the preview accurately reflects
+        the painted area.
+        """
+        # Screen-based brush radius: use brush_size directly (radius in px)
+        radius = max(1, int(self.brush_size))
+        x1 = x - radius
+        y1 = y - radius
+        x2 = x + radius
+        y2 = y + radius
+
+        color = "#00ff00" if self.reveal_mode else "#ff0000"
+
+        # If we already have a preview item, move/modify it; otherwise create
+        if self._brush_preview_id:
+            try:
+                self.preview_canvas.coords(self._brush_preview_id, x1, y1, x2, y2)
+                self.preview_canvas.itemconfig(self._brush_preview_id, outline=color)
+            except tk.TclError:
+                # Canvas item may have been deleted elsewhere; create again
+                self._brush_preview_id = None
+
+        if not self._brush_preview_id:
+            self._brush_preview_id = self.preview_canvas.create_oval(
+                x1, y1, x2, y2, outline=color, width=2
+            )
+
+    def _clear_brush_preview(self) -> None:
+        """Remove the brush preview if it exists."""
+        if self._brush_preview_id:
+            try:
+                self.preview_canvas.delete(self._brush_preview_id)
+            except tk.TclError:
+                pass
+            self._brush_preview_id = None
     def _on_brush_size_change(self, value: str) -> None:
         """Handle brush size slider change."""
         self.brush_size = int(float(value))
         self.brush_size_label.config(text=str(self.brush_size))
         self.app.config.brush_size = self.brush_size
+        # Update preview if present
+        if self._last_mouse_pos and self.current_tool == self.TOOL_BRUSH:
+            x, y = self._last_mouse_pos
+            self._update_brush_preview(x, y)
+
 
     def _adjust_brush_size(self, delta: int) -> None:
         """Adjust brush size by delta."""
@@ -301,14 +383,14 @@ class DMView:
     def _on_canvas_click(self, event: tk.Event) -> None:
         """Handle canvas click."""
         if self.current_tool == self.TOOL_BRUSH:
-            self._apply_brush(event.x, event.y)
+            self._start_brush(event.x, event.y)
         elif self.current_tool == self.TOOL_RECT:
             self._rect_start = (event.x, event.y)
 
     def _on_canvas_drag(self, event: tk.Event) -> None:
         """Handle canvas drag."""
         if self.current_tool == self.TOOL_BRUSH:
-            self._apply_brush(event.x, event.y)
+            self._continue_brush(event.x, event.y)
         elif self.current_tool == self.TOOL_RECT and self._rect_start:
             self._draw_rect_preview(event.x, event.y)
         # Note: pan via right-click overlay; left-click pan tool removed
@@ -321,6 +403,9 @@ class DMView:
             if self._rect_id:
                 self.preview_canvas.delete(self._rect_id)
                 self._rect_id = None
+        # Finish brush strokes by committing deferred updates
+        if self.current_tool == self.TOOL_BRUSH:
+            self._end_brush()
         # Note: pan via right-click overlay; left-click pan tool removed
         # Save session after any tool release to persist state
         self.app.save_session()
@@ -355,20 +440,88 @@ class DMView:
         )
 
     def _apply_brush(self, screen_x: int, screen_y: int) -> None:
-        """Apply brush at screen position."""
-        fog_mask = self.app.get_current_fog()
+        """One-off brush apply (single click)."""
+        fog_mask = self.app.get_current_fog_ref()
         if fog_mask is None:
             return
 
         map_x, map_y = self._screen_to_map_coords(screen_x, screen_y)
 
         # Scale brush size to map coordinates
-        brush_radius = int(self.brush_size / self.renderer.scale)
+        brush_radius = max(1, int(self.brush_size / max(0.0001, self.renderer.scale)))
 
         editor = FogEditor(fog_mask)
         editor.apply_brush(map_x, map_y, brush_radius, self.reveal_mode)
 
+        # This will update DM view immediately and (if not editing) will save and update player view
         self.app.update_fog(editor.get_mask())
+
+    def _start_brush(self, screen_x: int, screen_y: int) -> None:
+        """Start a brush stroke and begin a fog edit transaction."""
+        fog_mask = self.app.get_current_fog_ref()
+        if fog_mask is None:
+            return
+
+        map_x, map_y = self._screen_to_map_coords(screen_x, screen_y)
+        brush_radius = max(1, int(self.brush_size / max(0.0001, self.renderer.scale)))
+
+        # Start transaction
+        self.app.begin_fog_edit()
+
+        # Editor works directly on the in-memory fog mask reference
+        self._brush_editor = FogEditor(fog_mask)
+        self._brush_editor.apply_brush(map_x, map_y, brush_radius, self.reveal_mode)
+        self._brush_last_map_pos = (map_x, map_y)
+
+        # Update DM view immediately (player & disk will be deferred until end)
+        self.app.update_fog(self._brush_editor.get_mask())
+
+    def _continue_brush(self, screen_x: int, screen_y: int) -> None:
+        """Continue stroke: interpolate between last and current positions to avoid gaps."""
+        if self._brush_editor is None or self._brush_last_map_pos is None:
+            # If we somehow missed the start, treat as fresh start
+            self._start_brush(screen_x, screen_y)
+            return
+
+        map_x, map_y = self._screen_to_map_coords(screen_x, screen_y)
+        last_x, last_y = self._brush_last_map_pos
+
+        dx = map_x - last_x
+        dy = map_y - last_y
+        dist = math.hypot(dx, dy)
+
+        brush_radius = max(1, int(self.brush_size / max(0.0001, self.renderer.scale)))
+
+        if dist <= 0:
+            self._brush_editor.apply_brush(map_x, map_y, brush_radius, self.reveal_mode)
+        else:
+            # step size proportional to radius to guarantee overlap
+            step = max(1, int(brush_radius * 0.5))
+            steps = max(1, int(dist / step))
+            for i in range(1, steps + 1):
+                t = i / steps
+                ix = int(last_x + dx * t)
+                iy = int(last_y + dy * t)
+                self._brush_editor.apply_brush(ix, iy, brush_radius, self.reveal_mode)
+
+        # Update DM view with current in-memory mask
+        self._brush_last_map_pos = (map_x, map_y)
+        self.app.update_fog(self._brush_editor.get_mask())
+
+    def _end_brush(self) -> None:
+        """End a brush stroke: commit deferred updates (player view and save) and clear state."""
+        if self._brush_editor is None:
+            return
+
+        # Ensure DM view has latest mask
+        self.app.update_fog(self._brush_editor.get_mask())
+
+        # Commit deferred updates (player view + save)
+        self.app.end_fog_edit()
+
+        # Clear stroke state
+        self._brush_editor = None
+        self._brush_last_map_pos = None
 
     def _draw_rect_preview(self, x: int, y: int) -> None:
         """Draw rectangle selection preview."""

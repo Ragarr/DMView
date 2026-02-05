@@ -36,6 +36,10 @@ class Application:
         self._map_images: dict[str, Image.Image] = {}
         self._fog_masks: dict[str, Image.Image] = {}
 
+        # Fog edit transaction state: when True, player updates and disk saves are deferred
+        self._fog_edit_in_progress: bool = False
+        self._deferred_fog_changed: bool = False
+
         # Monitor info
         self.monitors = self._detect_monitors()
         self.player_monitor = None
@@ -429,6 +433,35 @@ class Application:
             self.session.active_map_index = index
             self._update_views()
 
+    def begin_fog_edit(self) -> None:
+        """Begin a fog edit transaction: defer player updates and disk saves until end."""
+        self._fog_edit_in_progress = True
+        self._deferred_fog_changed = False
+
+    def end_fog_edit(self) -> None:
+        """End a fog edit transaction: apply deferred updates (player view and save) if any."""
+        self._fog_edit_in_progress = False
+        if not self.session:
+            return
+        active_map = self.get_active_map()
+        if not active_map:
+            return
+        if self._deferred_fog_changed:
+            fog_mask = self._fog_masks.get(active_map.id)
+            if fog_mask:
+                # Update player view and persist
+                self.player_view.update_fog(fog_mask)
+                if self.session_manager:
+                    self.session_manager.save_fog_mask(active_map, fog_mask)
+            self._deferred_fog_changed = False
+
+    def get_current_fog_ref(self) -> Optional[Image.Image]:
+        """Return a reference to the current fog mask (no copy)."""
+        active_map = self.get_active_map()
+        if not active_map:
+            return None
+        return self._fog_masks.get(active_map.id)
+
     def update_fog(self, fog_mask: Image.Image) -> None:
         """Update the fog mask for the active map."""
         active_map = self.get_active_map()
@@ -437,11 +470,16 @@ class Application:
 
         self._fog_masks[active_map.id] = fog_mask
 
-        # Update both views
+        # Always update DM view immediately
         self.dm_view.update_fog(fog_mask)
-        self.player_view.update_fog(fog_mask)
 
-        # Auto-save fog
+        # If we're in an edit session, defer player update and save until end
+        if self._fog_edit_in_progress:
+            self._deferred_fog_changed = True
+            return
+
+        # Update player view and save immediately
+        self.player_view.update_fog(fog_mask)
         if self.session_manager:
             self.session_manager.save_fog_mask(active_map, fog_mask)
 
