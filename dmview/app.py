@@ -46,7 +46,10 @@ class Application:
         self.dm_view = DMView(root, self)
         self.player_view = PlayerView(root, self)
 
-        # Position player view
+        # Hide player view by default
+        self.player_view.hide()
+
+        # Position and show player view only when using a separate monitor
         if self.player_monitor:
             self.player_view.set_fullscreen(
                 self.player_monitor["x"],
@@ -54,6 +57,7 @@ class Application:
                 self.player_monitor["width"],
                 self.player_monitor["height"],
             )
+            self.player_view.show()
 
         # Load last session if available
         if self.config.last_session_path:
@@ -98,9 +102,9 @@ class Application:
     def _select_monitors(self) -> None:
         """Select which monitors to use for DM and player views."""
         if len(self.monitors) == 1:
-            # Single monitor - use it for both
+            # Single monitor - use it for DM only; don't show player window by default
             self.dm_monitor = self.monitors[0]
-            self.player_monitor = self.monitors[0]
+            self.player_monitor = None
             return
 
         # Multiple monitors - find primary for DM, secondary for player
@@ -121,7 +125,16 @@ class Application:
 
         # Use configured player monitor if valid
         if 0 <= self.config.player_monitor < len(self.monitors):
-            secondary = self.monitors[self.config.player_monitor]
+            candidate = self.monitors[self.config.player_monitor]
+            # If user selected the same monitor as the DM, disable the player view
+            if candidate["index"] == primary["index"]:
+                secondary = None
+            else:
+                secondary = candidate
+
+        # If secondary ended up being the same as primary, disable it
+        if secondary and secondary["index"] == primary["index"]:
+            secondary = None
 
         self.dm_monitor = primary
         self.player_monitor = secondary
@@ -261,18 +274,112 @@ class Application:
                     self._fog_masks[map_obj.id],
                 )
 
-    def add_map(self, filepath: str, name: str) -> None:
-        """Add a new map to the session."""
+    def add_map(self, filepath: str, name: str, tile_pixels: int | None = None, tile_size_mm: float | None = None) -> None:
+        """Add a new map to the session.
+
+        If tile_pixels and tile_size_mm are provided, they are used directly. If
+        not, fall back to the interactive prompts (legacy flow).
+        """
         if not self.session or not self.session_manager:
             return
 
         try:
-            map_obj = self.session_manager.add_map_from_file(
-                Path(filepath),
-                name,
-                tile_pixels=self.config.default_tile_pixels,
-                tile_size_mm=self.config.default_tile_size_mm,
-            )
+            if tile_pixels is not None and tile_size_mm is not None:
+                # Import directly with provided settings
+                map_obj = self.session_manager.add_map_from_file(
+                    Path(filepath),
+                    name,
+                    tile_pixels=tile_pixels,
+                    tile_size_mm=float(tile_size_mm),
+                )
+            else:
+                # Legacy interactive prompts (kept for compatibility)
+                # Open source image to inspect dimensions (do not copy yet)
+                with Image.open(Path(filepath)) as src_img:
+                    img_w, img_h = src_img.size
+
+                # Ask user which method to use
+                method = simpledialog.askstring(
+                    "Map Scale",
+                    "Choose scale input method:\n\n"
+                    "1 - Enter overall image width in mm (and optional tile size)\n"
+                    "2 - Enter number of tiles across and tile size in mm\n\n"
+                    "Enter 1 or 2:",
+                    parent=self.root,
+                )
+
+                if not method:
+                    return  # user cancelled
+
+                method = method.strip()
+                if method not in ("1", "2"):
+                    messagebox.showerror("Invalid option", "Please enter 1 or 2.", parent=self.root)
+                    return
+
+                t_size_mm = None
+                t_pixels = None
+
+                if method == "1":
+                    # Overall image width in mm
+                    width_mm = simpledialog.askfloat(
+                        "Image width (mm)",
+                        "Enter overall image width in millimeters:",
+                        parent=self.root,
+                        minvalue=1.0,
+                    )
+                    if width_mm is None:
+                        return
+
+                    # Optional: let user specify tile size, otherwise use default
+                    t_size_mm = simpledialog.askfloat(
+                        "Tile size (mm)",
+                        f"Enter tile size in millimeters (default {self.config.default_tile_size_mm} mm):",
+                        parent=self.root,
+                        minvalue=0.1,
+                    )
+                    if t_size_mm is None:
+                        t_size_mm = self.config.default_tile_size_mm
+
+                    ppmm = img_w / float(width_mm)
+                    t_pixels = max(1, int(round(ppmm * float(t_size_mm))))
+
+                else:  # method == "2"
+                    tiles_x = simpledialog.askinteger(
+                        "Tiles across",
+                        "Enter number of tiles across (columns):",
+                        parent=self.root,
+                        minvalue=1,
+                    )
+                    if tiles_x is None:
+                        return
+
+                    t_size_mm = simpledialog.askfloat(
+                        "Tile size (mm)",
+                        f"Enter tile size in millimeters (default {self.config.default_tile_size_mm} mm):",
+                        parent=self.root,
+                        minvalue=0.1,
+                    )
+                    if t_size_mm is None:
+                        t_size_mm = self.config.default_tile_size_mm
+
+                    # Compute pixels per tile from image width and number of tiles
+                    t_pixels = max(1, int(round(img_w / float(tiles_x))))
+
+                # Confirm computed values with the user
+                if not messagebox.askyesno(
+                    "Confirm Scale",
+                    f"Computed tile size: {t_size_mm} mm\nComputed pixels per tile: {t_pixels}\n\nProceed?",
+                    parent=self.root,
+                ):
+                    return
+
+                map_obj = self.session_manager.add_map_from_file(
+                    Path(filepath),
+                    name,
+                    tile_pixels=t_pixels,
+                    tile_size_mm=float(t_size_mm),
+                )
+
             self.session.add_map(map_obj)
             self.session_manager.save_session(self.session)
 
@@ -355,7 +462,12 @@ class Application:
             self.update_fog(editor.get_mask())
 
     def pan_map(self, dx: int, dy: int) -> None:
-        """Pan the map by the given delta."""
+        """Pan the map by the given delta.
+
+        Clamp pan so the player's viewport always stays within the map bounds
+        (based on the player view's current scale and size). Refresh both
+        player and DM views so overlays update in real time.
+        """
         active_map = self.get_active_map()
         if not active_map:
             return
@@ -363,13 +475,41 @@ class Application:
         active_map.pan_x += dx
         active_map.pan_y += dy
 
-        # Clamp to valid range
+        # Clamp to valid range based on player viewport size (in map pixels)
         if active_map.id in self._map_images:
             img = self._map_images[active_map.id]
-            active_map.pan_x = max(0, min(active_map.pan_x, img.width))
-            active_map.pan_y = max(0, min(active_map.pan_y, img.height))
 
-        self.player_view.refresh()
+            # Default to full image (no panning possible)
+            viewport_map_w = img.width
+            viewport_map_h = img.height
+
+            try:
+                pv = self.player_view
+                pv_w = pv.canvas.winfo_width()
+                pv_h = pv.canvas.winfo_height()
+                if pv_w > 1 and pv_h > 1 and pv.renderer.scale > 0:
+                    viewport_map_w = int(pv_w / pv.renderer.scale)
+                    viewport_map_h = int(pv_h / pv.renderer.scale)
+            except Exception:
+                # If we can't query player view, fall back to full image
+                viewport_map_w = img.width
+                viewport_map_h = img.height
+
+            max_pan_x = max(0, img.width - viewport_map_w)
+            max_pan_y = max(0, img.height - viewport_map_h)
+
+            active_map.pan_x = max(0, min(active_map.pan_x, max_pan_x))
+            active_map.pan_y = max(0, min(active_map.pan_y, max_pan_y))
+
+        # Refresh both views so overlay and player display update
+        try:
+            self.player_view.refresh()
+        except Exception:
+            pass
+        try:
+            self.dm_view.refresh()
+        except Exception:
+            pass
 
     def _on_close(self) -> None:
         """Handle application close."""

@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING, Optional
 
 from PIL import Image, ImageTk
 
-from map_canvas import FogEditor, MapRenderer, screen_to_map
+from map_canvas import FogEditor, MapRenderer, screen_to_map, map_to_screen
+from map_import_dialog import MapImportDialog
 
 if TYPE_CHECKING:
     from app import Application
@@ -18,7 +19,6 @@ class DMView:
     # Tool constants
     TOOL_BRUSH = "brush"
     TOOL_RECT = "rect"
-    TOOL_PAN = "pan"
 
     def __init__(self, root: tk.Tk, app: "Application"):
         """
@@ -41,6 +41,13 @@ class DMView:
         self._drag_start: Optional[tuple[int, int]] = None
         self._rect_start: Optional[tuple[int, int]] = None
         self._rect_id: Optional[int] = None
+
+        # Preview viewport drag (right-click) state
+        self._viewport_drag_start: Optional[tuple[int, int]] = None
+        self._viewport_last_pos: Optional[tuple[int, int]] = None
+        # Whether we're dragging the overlay rectangle specifically
+        self._overlay_dragging: bool = False
+        self._overlay_drag_last: Optional[tuple[int, int]] = None
 
         # Image references
         self._current_image: Optional[ImageTk.PhotoImage] = None
@@ -126,11 +133,6 @@ class DMView:
         )
         self.rect_btn.pack(side=tk.LEFT, padx=2, pady=2)
 
-        self.pan_btn = ttk.Button(
-            tool_frame, text="Pan", command=lambda: self._set_tool(self.TOOL_PAN)
-        )
-        self.pan_btn.pack(side=tk.LEFT, padx=2, pady=2)
-
         # Mode toggle
         mode_frame = ttk.LabelFrame(toolbar, text="Mode")
         mode_frame.pack(side=tk.LEFT, padx=5)
@@ -208,12 +210,16 @@ class DMView:
         self.preview_canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.preview_canvas.bind("<Configure>", self._on_canvas_resize)
 
+        # Right-click drag on DM preview moves the player viewport (intuitive panning)
+        self.preview_canvas.bind("<Button-3>", self._on_viewport_drag_start)
+        self.preview_canvas.bind("<B3-Motion>", self._on_viewport_drag)
+        self.preview_canvas.bind("<ButtonRelease-3>", self._on_viewport_drag_end)
+
         # Keyboard shortcuts
         self.root.bind("<r>", lambda e: self.mode_var.set("reveal") or self._on_mode_change())
         self.root.bind("<h>", lambda e: self.mode_var.set("hide") or self._on_mode_change())
         self.root.bind("<b>", lambda e: self._set_tool(self.TOOL_BRUSH))
         self.root.bind("<t>", lambda e: self._set_tool(self.TOOL_RECT))
-        self.root.bind("<p>", lambda e: self._set_tool(self.TOOL_PAN))
         self.root.bind("<bracketleft>", lambda e: self._adjust_brush_size(-5))
         self.root.bind("<bracketright>", lambda e: self._adjust_brush_size(5))
         self.root.bind("<Control-s>", lambda e: self.app.save_session())
@@ -226,8 +232,7 @@ class DMView:
 
         # Update button states visually
         for btn, t in [(self.brush_btn, self.TOOL_BRUSH),
-                       (self.rect_btn, self.TOOL_RECT),
-                       (self.pan_btn, self.TOOL_PAN)]:
+                       (self.rect_btn, self.TOOL_RECT)]:
             if t == tool:
                 btn.state(["pressed"])
             else:
@@ -257,23 +262,25 @@ class DMView:
             self.app.select_map(index)
 
     def _add_map(self) -> None:
-        """Add a new map to the session."""
+        """Add a new map to the session using the Import dialog."""
         if not self.app.session_manager:
             messagebox.showwarning("No Session", "Please create or open a session first.")
             return
 
-        filepath = filedialog.askopenfilename(
-            title="Select Map Image",
-            filetypes=[
-                ("Image files", "*.png *.jpg *.jpeg *.webp *.bmp"),
-                ("All files", "*.*"),
-            ],
-        )
+        # Use the single-window import dialog (file selection, scaling method, preview)
 
-        if filepath:
-            name = simpledialog.askstring("Map Name", "Enter a name for this map:")
-            if name:
-                self.app.add_map(filepath, name)
+        def _on_import(filepath: str, name: str, tile_pixels: int, tile_size_mm: float) -> None:
+            # Called by the dialog when user confirms import
+            self._on_map_import(filepath, name, tile_pixels, tile_size_mm)
+
+        MapImportDialog(self.root, on_import=_on_import, default_tile_mm=self.app.config.default_tile_size_mm)
+
+    def _on_map_import(self, filepath: str, name: str, tile_pixels: int, tile_size_mm: float) -> None:
+        """Handle the confirmed import from the dialog."""
+        try:
+            self.app.add_map(filepath, name, tile_pixels=tile_pixels, tile_size_mm=tile_size_mm)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to add map: {e}", parent=self.root)
 
     def _remove_map(self) -> None:
         """Remove the selected map."""
@@ -297,8 +304,6 @@ class DMView:
             self._apply_brush(event.x, event.y)
         elif self.current_tool == self.TOOL_RECT:
             self._rect_start = (event.x, event.y)
-        elif self.current_tool == self.TOOL_PAN:
-            self._drag_start = (event.x, event.y)
 
     def _on_canvas_drag(self, event: tk.Event) -> None:
         """Handle canvas drag."""
@@ -306,8 +311,7 @@ class DMView:
             self._apply_brush(event.x, event.y)
         elif self.current_tool == self.TOOL_RECT and self._rect_start:
             self._draw_rect_preview(event.x, event.y)
-        elif self.current_tool == self.TOOL_PAN and self._drag_start:
-            self._apply_pan(event.x, event.y)
+        # Note: pan via right-click overlay; left-click pan tool removed
 
     def _on_canvas_release(self, event: tk.Event) -> None:
         """Handle canvas release."""
@@ -317,26 +321,36 @@ class DMView:
             if self._rect_id:
                 self.preview_canvas.delete(self._rect_id)
                 self._rect_id = None
-        elif self.current_tool == self.TOOL_PAN:
-            self._drag_start = None
-            self.app.save_session()
-
+        # Note: pan via right-click overlay; left-click pan tool removed
+        # Save session after any tool release to persist state
+        self.app.save_session()
     def _on_canvas_resize(self, event: tk.Event) -> None:
         """Handle canvas resize."""
         self.refresh()
 
     def _screen_to_map_coords(self, screen_x: int, screen_y: int) -> tuple[int, int]:
-        """Convert screen coordinates to map coordinates."""
+        """Convert screen coordinates to map coordinates for the DM preview.
+
+        Important: DM preview renders the full map (no pan), while the player
+        view may be panned. Tools used from the DM preview (brush/rect) must
+        map to the absolute map coordinates, not the player's panned viewport.
+        Therefore we pass pan_x/pan_y = 0 (the DM render pan) when converting
+        coordinates.
+        """
         active_map = self.app.get_active_map()
         if not active_map:
             return 0, 0
+
+        # DM preview shows the full map with no pan applied in rendering
+        dm_pan_x = 0
+        dm_pan_y = 0
 
         return screen_to_map(
             screen_x,
             screen_y,
             self.renderer.scale,
-            active_map.pan_x,
-            active_map.pan_y,
+            dm_pan_x,
+            dm_pan_y,
             self._preview_offset,
         )
 
@@ -383,20 +397,99 @@ class DMView:
         self.app.update_fog(editor.get_mask())
 
     def _apply_pan(self, x: int, y: int) -> None:
-        """Apply pan based on drag."""
+        """Apply pan based on drag (used by pan tool).
+
+        Use the same intuitive direction as overlay drag: mouse movement to the
+        right moves the viewport right. Apply small threshold to avoid jitter.
+        """
         if not self._drag_start:
             return
 
-        dx = self._drag_start[0] - x
-        dy = self._drag_start[1] - y
+        last_x, last_y = self._drag_start
+        # Compute delta as event - last so positive movement corresponds to
+        # moving the viewport in the same direction as the mouse.
+        dx = x - last_x
+        dy = y - last_y
 
         # Convert to map coordinates
+        if self.renderer.scale <= 0:
+            return
         map_dx = int(dx / self.renderer.scale)
         map_dy = int(dy / self.renderer.scale)
 
-        self.app.pan_map(map_dx, map_dy)
-        self._drag_start = (x, y)
+        # Small threshold so tiny movements don't trigger many pan calls
+        if map_dx != 0 or map_dy != 0:
+            self.app.pan_map(map_dx, map_dy)
+            self._drag_start = (x, y)
 
+    def _on_viewport_drag_start(self, event: tk.Event) -> None:
+        """Start dragging the preview to move the player viewport."""
+        self._viewport_drag_start = (event.x, event.y)
+        self._viewport_last_pos = (event.x, event.y)
+
+    def _on_viewport_drag(self, event: tk.Event) -> None:
+        """Handle incremental right-button drag to pan the player view when dragging empty preview area."""
+        # If overlay drag is active, ignore this handler
+        if self._overlay_dragging:
+            return
+
+        if not self._viewport_last_pos:
+            self._viewport_last_pos = (event.x, event.y)
+            return
+
+        last_x, last_y = self._viewport_last_pos
+        # Use event - last so dragging right gives positive dx
+        dx = event.x - last_x
+        dy = event.y - last_y
+
+        # Convert to map pixels based on the DM preview scale
+        if self.renderer.scale <= 0:
+            return
+        map_dx = int(dx / self.renderer.scale)
+        map_dy = int(dy / self.renderer.scale)
+
+        # Small threshold to avoid noise when movement is less than one map pixel
+        if map_dx != 0 or map_dy != 0:
+            self.app.pan_map(map_dx, map_dy)
+            self._viewport_last_pos = (event.x, event.y)
+
+    def _on_overlay_drag_start(self, event: tk.Event) -> None:
+        """Start dragging the viewport overlay rectangle."""
+        self._overlay_dragging = True
+        self._overlay_drag_last = (event.x, event.y)
+
+    def _on_overlay_drag(self, event: tk.Event) -> None:
+        """Drag the overlay and move the player view to match the new rectangle position."""
+        if not self._overlay_dragging or not self._overlay_drag_last:
+            self._overlay_drag_last = (event.x, event.y)
+            return
+
+        last_x, last_y = self._overlay_drag_last
+        dx = event.x - last_x
+        dy = event.y - last_y
+
+        # Convert preview delta to map pixels based on DM preview scale
+        if self.renderer.scale <= 0:
+            return
+        map_dx = int(dx / self.renderer.scale)
+        map_dy = int(dy / self.renderer.scale)
+
+        if map_dx != 0 or map_dy != 0:
+            self.app.pan_map(map_dx, map_dy)
+            self._overlay_drag_last = (event.x, event.y)
+
+    def _on_overlay_drag_end(self, event: tk.Event) -> None:
+        """Finish overlay drag and save session state."""
+        self._overlay_dragging = False
+        self._overlay_drag_last = None
+        # Persist the new pan
+        self.app.save_session()
+    def _on_viewport_drag_end(self, event: tk.Event) -> None:
+        """End dragging the preview."""
+        self._viewport_drag_start = None
+        self._viewport_last_pos = None
+        # Save session state after panning
+        self.app.save_session()
     def set_map(self, map_image: Image.Image, fog_mask: Image.Image) -> None:
         """Set the map and fog to display."""
         self.renderer.set_map(map_image, fog_mask)
@@ -460,6 +553,51 @@ class DMView:
                 image=self._current_image,
                 anchor=tk.CENTER,
             )
+
+            # Draw overlay indicating player viewport on the DM preview
+            # Remove any previous overlay
+            self.preview_canvas.delete("player_viewport")
+
+            # Only draw if a player view exists
+            if self.app.player_view is not None:
+                try:
+                    pv = self.app.player_view
+                    pv_w = pv.canvas.winfo_width()
+                    pv_h = pv.canvas.winfo_height()
+                    # Proceed only if valid size
+                    if pv_w > 1 and pv_h > 1 and active_map is not None:
+                        player_scale = pv.renderer.scale
+                        player_pan_x = active_map.pan_x
+                        player_pan_y = active_map.pan_y
+
+                        # Visible area in map coordinates
+                        vis_map_w = int(pv_w / player_scale)
+                        vis_map_h = int(pv_h / player_scale)
+
+                        # Map top-left and bottom-right in screen coords (DM preview)
+                        sx1, sy1 = map_to_screen(player_pan_x, player_pan_y, self.renderer.scale, 0, 0, self._preview_offset)
+                        sx2, sy2 = map_to_screen(player_pan_x + vis_map_w, player_pan_y + vis_map_h, self.renderer.scale, 0, 0, self._preview_offset)
+
+                        # Draw rectangle
+                        rect_id = self.preview_canvas.create_rectangle(
+                            sx1, sy1, sx2, sy2,
+                            outline="#00ff00",
+                            width=2,
+                            dash=(4,),
+                            tags=("player_viewport",),
+                        )
+
+                        # Bind overlay drag handlers to the player_viewport tag
+                        try:
+                            # Tag bindings persist; ensure overlay drag is handled
+                            self.preview_canvas.tag_bind("player_viewport", "<Button-3>", self._on_overlay_drag_start)
+                            self.preview_canvas.tag_bind("player_viewport", "<B3-Motion>", self._on_overlay_drag)
+                            self.preview_canvas.tag_bind("player_viewport", "<ButtonRelease-3>", self._on_overlay_drag_end)
+                        except Exception:
+                            pass
+                except Exception:
+                    # Avoid crashing DM view if anything goes wrong drawing overlay
+                    pass
 
     def update_map_list(self, maps: list, active_index: int) -> None:
         """Update the map listbox."""

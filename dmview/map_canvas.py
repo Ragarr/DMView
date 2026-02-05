@@ -65,12 +65,16 @@ class MapRenderer:
         scaled_fog = self.fog_mask.resize((scaled_w, scaled_h), Image.NEAREST)
 
         # Create fog overlay
-        fog_opacity = 180 if is_dm_view else 255
-        fog_rgba = Image.new("RGBA", (scaled_w, scaled_h), (0, 0, 0, fog_opacity))
+        fog_opacity = 120 if is_dm_view else 255
 
         # Invert fog mask: black (hidden) becomes opaque, white (revealed) becomes transparent
         inverted_fog = ImageOps.invert(scaled_fog)
-        fog_rgba.putalpha(inverted_fog)
+
+        # Scale inverted mask by desired opacity so DM view fog is semi-transparent
+        # (i.e. multiply each pixel by fog_opacity / 255)
+        alpha_mask = inverted_fog.point(lambda p: int(p * fog_opacity / 255))
+        fog_rgba = Image.new("RGBA", (scaled_w, scaled_h), (0, 0, 0, 0))
+        fog_rgba.putalpha(alpha_mask)
 
         # Composite fog over map
         composited = Image.alpha_composite(scaled_map, fog_rgba)
@@ -136,11 +140,12 @@ class MapRenderer:
         scaled_map = self.map_image.resize((scaled_w, scaled_h), Image.LANCZOS)
         scaled_fog = self.fog_mask.resize((scaled_w, scaled_h), Image.NEAREST)
 
-        # Create fog overlay
+        # Create fog overlay for thumbnail
         fog_opacity = 128 if is_dm_view else 255
-        fog_rgba = Image.new("RGBA", (scaled_w, scaled_h), (0, 0, 0, fog_opacity))
         inverted_fog = ImageOps.invert(scaled_fog)
-        fog_rgba.putalpha(inverted_fog)
+        alpha_mask = inverted_fog.point(lambda p: int(p * fog_opacity / 255))
+        fog_rgba = Image.new("RGBA", (scaled_w, scaled_h), (0, 0, 0, 0))
+        fog_rgba.putalpha(alpha_mask)
 
         composited = Image.alpha_composite(scaled_map, fog_rgba)
 
