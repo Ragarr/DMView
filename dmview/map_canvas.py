@@ -141,7 +141,7 @@ class MapRenderer:
         scaled_fog = self.fog_mask.resize((scaled_w, scaled_h), Image.NEAREST)
 
         # Create fog overlay for thumbnail
-        fog_opacity = 128 if is_dm_view else 255
+        fog_opacity = 200 if is_dm_view else 255
         inverted_fog = ImageOps.invert(scaled_fog)
         alpha_mask = inverted_fog.point(lambda p: int(p * fog_opacity / 255))
         fog_rgba = Image.new("RGBA", (scaled_w, scaled_h), (0, 0, 0, 0))
