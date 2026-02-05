@@ -1,5 +1,3 @@
-# System Requirements
-
 **Map projection at scale with fog of war for in-person tabletop play**
 
 ---
